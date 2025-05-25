@@ -21,13 +21,12 @@ class Worker extends EventEmitter {
         this.processingJobs = new Map(); // Global map of jobs being processed
 
         // ==== Soporte de grupos ====
-        const groupConfig = params.group || {};
-        this.groupConcurrency = Number(groupConfig.concurrency) || 1; // max. per group
+        this.groupConcurrency = 0; // se fijará tras leer this.concurrency
 
         // Map of jobs being processed by group
         this.processingByGroup = new Map();
 
-        // List of discovered groups; if the user passes groups in params we use it
+        // List of discovered groups; if the user passes groups in params.groups lo usamos
         this.groups = params.groups || [];
         this.groupsSetKey = `${this.prefix}:groups:set`;
         this.currentGroupIdx = 0; // index for round-robin
@@ -51,15 +50,25 @@ class Worker extends EventEmitter {
 
         // Execution parameters (global)
         this.concurrency = params.concurrency || 1;
+        this.groupConcurrency = this.concurrency; // usar el mismo límite por grupo
         this.removeOnComplete = params.removeOnComplete || false;
         this.removeOnFail = params.removeOnFail || 5000;
         this.batchSize = params.batchSize || 1;
         this.pollInterval = params.pollInterval || 1000;
-        this.stallInterval = params.stallInterval || 30000; // Interval to check stalled jobs (global)
+        // this.stallInterval se define más abajo junto con control interno
         this.lockDuration = params.lockDuration || 30000; // Job lock duration (global)
 
         // Execution control (global)
         this.isRunning = false;
+
+        // Intervalo para detectar trabajos estancados (que quedaron en "processing" sin lock)
+        // this.stallInterval se define más abajo junto con control interno
+
+        this._lockInterval = null; // se establecerá en start()
+        this._stallIntervalId = null; // intervalo de verificación de estancados
+
+        // util sleep
+        this._sleep = (ms) => new Promise((res) => setTimeout(res, ms));
     }
 
     /**
@@ -104,11 +113,16 @@ class Worker extends EventEmitter {
         }
 
         // Start the lock renewal interval
-        const lockInterval = setInterval(() => {
+        this._lockInterval = setInterval(() => {
             for (const [jobId] of this.processingJobs) {
                 this.renewLock(jobId).catch(console.error);
             }
         }, Math.floor(this.lockDuration / 2));
+
+        // Intervalo para recuperar trabajos estancados
+        this._stallIntervalId = setInterval(() => {
+            this.recoverStalledJobs().catch(console.error);
+        }, this.stallInterval);
 
         try {
             while (this.isRunning) {
@@ -158,103 +172,12 @@ class Worker extends EventEmitter {
                         continue;
                     }
 
-                    // Process jobs in parallel
-                    await Promise.all(jobIds.map(async (jobId) => {
-                        const jobKey = `${this.prefix}:job:${jobId}`;
-
-                        // Try to get the lock
-                        if (!await this.acquireLock(jobId)) {
-                            console.warn(`Could not get lock for job ${jobId}`);
-                            return;
-                        }
-
-                        // Register the job as being processed (global and by group)
-                        this.processingJobs.set(jobId, Date.now());
-                        groupProcessingMap.set(jobId, Date.now());
-
-                        try {
-                            const jobData = await this.connection.hgetall(jobKey);
-                            if (!jobData) {
-                                await this.releaseLock(jobId);
-                                this.processingJobs.delete(jobId);
-                                groupProcessingMap.delete(jobId);
-                                return;
-                            }
-
-                            // Ensure we have valid data
-                            if (!jobData.data) {
-                                jobData.data = '{}';
-                            }
-
-                            // Validate that the JSON is valid before processing it
-                            let parsedData;
-                            try {
-                                parsedData = JSON.parse(jobData.data);
-                            } catch (parseError) {
-                                console.error(`Error parsing job data for ${jobId}:`, parseError);
-                                jobData.data = '{}';
-                                parsedData = {};
-                            }
-
-                            // Remove any previous errors and update status
-                            await this.connection.pipeline()
-                                .hdel(jobKey, 'error')
-                                .hset(jobKey, 'status', 'processing')
-                                .exec();
-
-                            // Emit the start event
-                            this.emit('processing', { jobId, data: jobData });
-
-                            try {
-                                // Process the job
-                                await this.callback({
-                                    id: jobId,
-                                    name: jobData.name || 'unknown',
-                                    data: parsedData
-                                });
-
-                                // Mark as completed
-                                await this.connection.pipeline()
-                                    .hset(jobKey, 'status', 'completed')
-                                    .xadd(
-                                        `${this.prefix}:events`,
-                                        '*',
-                                        'event', 'completed',
-                                        'jobId', jobId
-                                    )
-                                    .exec();
-
-                                this.emit('completed', { jobId });
-
-                            } catch (error) {
-                                // Mark as failed
-                                await this.connection.pipeline()
-                                    .hset(jobKey,
-                                        'status', 'failed',
-                                        'error', error.message
-                                    )
-                                    .xadd(
-                                        `${this.prefix}:events`,
-                                        '*',
-                                        'event', 'failed',
-                                        'jobId', jobId,
-                                        'error', error.message
-                                    )
-                                    .exec();
-
-                                this.emit('failed', { jobId, error });
-                            }
-
-                        } catch (error) {
-                            console.error(`Error processing job ${jobId}:`, error);
-                            this.emit('error', { jobId, error });
-                        } finally {
-                            // Clean up
-                            await this.releaseLock(jobId);
-                            this.processingJobs.delete(jobId);
-                            groupProcessingMap.delete(jobId);
-                        }
-                    }));
+                    // Launch jobs asynchronously without blocking the main loop
+                    for (const jobId of jobIds) {
+                        this._handleJob(jobId, group).catch((err) => {
+                            console.error('Unhandled error in _handleJob:', err);
+                        });
+                    }
 
                 } catch (error) {
                     console.error('Error in batch processing:', error);
@@ -262,12 +185,149 @@ class Worker extends EventEmitter {
                 }
             }
         } finally {
-            clearInterval(lockInterval);
+            clearInterval(this._lockInterval);
+            clearInterval(this._stallIntervalId);
         }
     }
 
-    stop() {
+    /**
+     * Detiene el worker de forma graceful.
+     * Espera a que los trabajos en curso finalicen (hasta timeout)
+     * @param {number} timeoutMs tiempo máximo a esperar en ms (default 30000)
+     */
+    async stop(timeoutMs = 30000) {
         this.isRunning = false;
+
+        const start = Date.now();
+        while (this.processingJobs.size > 0 && (Date.now() - start) < timeoutMs) {
+            await this._sleep(100);
+        }
+
+        if (this.processingJobs.size > 0) {
+            console.warn('Worker detenido con trabajos aún en proceso. Considera aumentar el timeout.');
+        }
+
+        // limpiar intervalos por si start no fue alcanzado completamente
+        if (this._lockInterval) clearInterval(this._lockInterval);
+        if (this._stallIntervalId) clearInterval(this._stallIntervalId);
+    }
+
+    /**
+     * Recorre los trabajos en estado "processing" sin lock y los reencola.
+     */
+    async recoverStalledJobs() {
+        let cursor = '0';
+        let recovered = 0;
+        do {
+            const [nextCursor, keys] = await this.connection.scan(cursor, 'MATCH', `${this.prefix}:job:*`, 'COUNT', 1000);
+            if (keys.length) {
+                const pipeline = this.connection.pipeline();
+                keys.forEach((k) => {
+                    pipeline.hget(k, 'status');
+                    pipeline.hget(k, 'group');
+                });
+                const results = await pipeline.exec();
+
+                for (let idx = 0; idx < keys.length; idx++) {
+                    const status = results[idx * 2][1];
+                    const group = results[idx * 2 + 1][1] || 'default';
+                    if (status === 'processing') {
+                        const jobId = keys[idx].split(':').pop();
+                        const lockKey = `${this.prefix}:lock:${jobId}`;
+                        const lockExists = await this.connection.exists(lockKey);
+                        if (!lockExists) {
+                            // requeue
+                            await this.connection.pipeline()
+                                .hset(keys[idx], 'status', 'waiting')
+                                .lpush(`${this.prefix}:groups:${group}`, jobId)
+                                .xadd(`${this.prefix}:events`, '*', 'event', 'stalled', 'jobId', jobId)
+                                .exec();
+
+                            console.warn(`[Worker] Job ${jobId} recovered from stalled state (group: ${group})`);
+                            recovered += 1;
+                        }
+                    }
+                }
+            }
+            cursor = nextCursor;
+        } while (cursor !== '0');
+
+        if (recovered > 0) {
+            console.log(`[Worker] Stall recovery cycle completed. Recovered: ${recovered}`);
+        }
+    }
+
+    /**
+     * Procesa un job individual manteniendo los mapas de seguimiento
+     * @private
+     */
+    async _handleJob(jobId, group) {
+        const groupProcessingMap = this.processingByGroup.get(group);
+        const jobKey = `${this.prefix}:job:${jobId}`;
+
+        // Try to get the lock
+        if (!await this.acquireLock(jobId)) {
+            console.warn(`Could not get lock for job ${jobId}`);
+            return;
+        }
+
+        // Register the job as being processed (global and by group)
+        this.processingJobs.set(jobId, Date.now());
+        groupProcessingMap.set(jobId, Date.now());
+
+        try {
+            const jobData = await this.connection.hgetall(jobKey);
+            if (!jobData) {
+                await this.releaseLock(jobId);
+                this.processingJobs.delete(jobId);
+                groupProcessingMap.delete(jobId);
+                return;
+            }
+
+            if (!jobData.data) jobData.data = '{}';
+
+            let parsedData;
+            try {
+                parsedData = JSON.parse(jobData.data);
+            } catch (parseError) {
+                console.error(`Error parsing job data for ${jobId}:`, parseError);
+                parsedData = {};
+            }
+
+            await this.connection.pipeline()
+                .hdel(jobKey, 'error')
+                .hset(jobKey, 'status', 'processing')
+                .exec();
+
+            this.emit('processing', { jobId, data: jobData });
+
+            try {
+                await this.callback({ id: jobId, name: jobData.name || 'unknown', data: parsedData });
+
+                await this.connection.pipeline()
+                    .hset(jobKey, 'status', 'completed')
+                    .xadd(`${this.prefix}:events`, '*', 'event', 'completed', 'jobId', jobId)
+                    .exec();
+
+                this.emit('completed', { jobId });
+
+            } catch (error) {
+                await this.connection.pipeline()
+                    .hset(jobKey, 'status', 'failed', 'error', error.message)
+                    .xadd(`${this.prefix}:events`, '*', 'event', 'failed', 'jobId', jobId, 'error', error.message)
+                    .exec();
+
+                this.emit('failed', { jobId, error });
+            }
+
+        } catch (error) {
+            console.error(`Error processing job ${jobId}:`, error);
+            this.emit('error', { jobId, error });
+        } finally {
+            await this.releaseLock(jobId);
+            this.processingJobs.delete(jobId);
+            groupProcessingMap.delete(jobId);
+        }
     }
 }
 

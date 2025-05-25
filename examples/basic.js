@@ -62,12 +62,15 @@ const main = async () => {
 
     const worker = new Worker('FAZPIAI', 'EMAILS', async (job) => {
         console.log('Job:', job);
+
+        // Esperamos 10 segundos
+        await new Promise(resolve => setTimeout(resolve, 10000));
+
     }, {
         connection,
         concurrency: 1,
         batchSize: 1,
-        pollInterval: 1000,
-        group: { concurrency: 1 }
+        pollInterval: 1000
     });
 
     worker.on('processing', (job) => {
