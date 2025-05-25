@@ -2,18 +2,29 @@
   "name": "@fazpi-ai/task-chain",
   "version": "1.0.0",
   "description": "Powerful distributed processing library based on Redis Streams, designed to build parallel, ordered, and reliable workflows.",
-  "main": "src/index.js",
+  "type": "module",
+  "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/fazpi-ai/task-chain.git"
+  "keywords": [
+    "queue",
+    "redis",
+    "jobs"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "ioredis": "^5.3.2"
   },
-  "author": "Rafael Jose Garcia Suarez",
-  "license": "GPL-3.0-or-later",
-  "bugs": {
-    "url": "https://github.com/fazpi-ai/task-chain/issues"
+  "devDependencies": {
+    "jest": "^29.7.0"
   },
-  "homepage": "https://github.com/fazpi-ai/task-chain#readme"
+  "jest": {
+    "transform": {},
+    "testEnvironment": "node",
+    "moduleNameMapper": {
+      "^(\\.{1,2}/.*)\\.js$": "$1"
+    }
+  }
 }
