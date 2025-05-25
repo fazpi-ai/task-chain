@@ -18,23 +18,52 @@ class Worker extends EventEmitter {
         // Callback to process the job
         this.callback = callback;
 
-        this.processingJobs = new Map();
+        this.processingJobs = new Map(); // Global map of jobs being processed
 
-        // Execution parameters
+        // ==== Soporte de grupos ====
+        const groupConfig = params.group || {};
+        this.groupConcurrency = Number(groupConfig.concurrency) || 1; // max. per group
+
+        // Map of jobs being processed by group
+        this.processingByGroup = new Map();
+
+        // List of discovered groups; if the user passes groups in params we use it
+        this.groups = params.groups || [];
+        this.groupsSetKey = `${this.prefix}:groups:set`;
+        this.currentGroupIdx = 0; // index for round-robin
+
+        // Helper to get list of groups from Redis
+        this.refreshGroups = async () => {
+            try {
+                const groupsFromRedis = await this.connection.smembers(this.groupsSetKey);
+                if (Array.isArray(groupsFromRedis) && groupsFromRedis.length > 0) {
+                    this.groups = groupsFromRedis.sort(); // consistent order
+                }
+            } catch (err) {
+                console.error('Error getting groups:', err);
+            }
+        };
+
+        // Initialize map by group (if there are predefined groups)
+        for (const g of this.groups) {
+            this.processingByGroup.set(g, new Map());
+        }
+
+        // Execution parameters (global)
         this.concurrency = params.concurrency || 1;
         this.removeOnComplete = params.removeOnComplete || false;
         this.removeOnFail = params.removeOnFail || 5000;
         this.batchSize = params.batchSize || 1;
         this.pollInterval = params.pollInterval || 1000;
-        this.stallInterval = params.stallInterval || 30000; // Interval to check stalled jobs
-        this.lockDuration = params.lockDuration || 30000; // Job lock duration
+        this.stallInterval = params.stallInterval || 30000; // Interval to check stalled jobs (global)
+        this.lockDuration = params.lockDuration || 30000; // Job lock duration (global)
 
-        // Execution control
+        // Execution control (global)
         this.isRunning = false;
     }
 
     /**
-   * Get a lock for a job
+   * Get a lock for a job (global)
    * @private
    */
     async acquireLock(jobId) {
@@ -84,19 +113,39 @@ class Worker extends EventEmitter {
         try {
             while (this.isRunning) {
                 try {
-                    // Check if we can process more jobs
-                    if (this.processingJobs.size >= this.concurrency) {
-                        await new Promise(resolve => setTimeout(resolve, 100));
+                    // ================= ROUND-ROBIN BY GROUPS =================
+                    // Ensure we have groups; refresh periodically
+                    if (this.groups.length === 0 || this.currentGroupIdx === 0) {
+                        await this.refreshGroups();
+                    }
+
+                    if (this.groups.length === 0) {
+                        await new Promise(resolve => setTimeout(resolve, this.pollInterval));
+                        continue; // No groups yet
+                    }
+
+                    const group = this.groups[this.currentGroupIdx];
+                    this.currentGroupIdx = (this.currentGroupIdx + 1) % this.groups.length;
+
+                    // Map for the current group
+                    if (!this.processingByGroup.has(group)) {
+                        this.processingByGroup.set(group, new Map());
+                    }
+                    const groupProcessingMap = this.processingByGroup.get(group);
+
+                    // Respect concurrency
+                    const freeGlobal = this.concurrency - this.processingJobs.size;
+                    const freeGroup = this.groupConcurrency - groupProcessingMap.size;
+                    if (freeGlobal <= 0 || freeGroup <= 0) {
+                        await new Promise(resolve => setTimeout(resolve, 0));
                         continue;
                     }
 
-                    // Calculate how many jobs we can take
-                    const availableSlots = this.concurrency - this.processingJobs.size;
-                    const currentBatchSize = Math.min(this.batchSize, availableSlots);
+                    const currentBatchSize = Math.min(this.batchSize, freeGlobal, freeGroup);
 
-                    // Get jobs from the queue
+                    // Get jobs from the group
                     const jobs = await this.connection.pipeline()
-                        .rpop(`${this.prefix}:wait`, currentBatchSize)
+                        .rpop(`${this.prefix}:groups:${group}`, currentBatchSize)
                         .exec();
 
                     const jobIds = jobs
@@ -119,14 +168,16 @@ class Worker extends EventEmitter {
                             return;
                         }
 
-                        // Register the job as being processed
+                        // Register the job as being processed (global and by group)
                         this.processingJobs.set(jobId, Date.now());
+                        groupProcessingMap.set(jobId, Date.now());
 
                         try {
                             const jobData = await this.connection.hgetall(jobKey);
                             if (!jobData) {
                                 await this.releaseLock(jobId);
                                 this.processingJobs.delete(jobId);
+                                groupProcessingMap.delete(jobId);
                                 return;
                             }
 
@@ -201,6 +252,7 @@ class Worker extends EventEmitter {
                             // Clean up
                             await this.releaseLock(jobId);
                             this.processingJobs.delete(jobId);
+                            groupProcessingMap.delete(jobId);
                         }
                     }));
 

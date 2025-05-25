@@ -15,7 +15,7 @@ class Queue {
         this.appName = appName;
         this.queueName = queueName;
         this.connection = params.connection;
-        
+
 
         // Load Lua script
         this.addJobScript = readFileSync(
@@ -42,21 +42,30 @@ class Queue {
 
         const timestamp = Date.now();
 
-        // Keys that the Lua script will use
+        // Determine group
+        let group = 'default';
+        if (data && typeof data === 'object' && data.group && typeof data.group === 'object' && data.group.id) {
+            group = data.group.id;
+        }
+
+        // Keys that will be used by the Lua script
         const keys = [
-            `${this.prefix}:wait`,    // waiting queue
-            `${this.prefix}:meta`,    // Metadata
-            `${this.prefix}:counter`, // ID Counter
-            `${this.prefix}:events`,  // Event Stream
+            `${this.prefix}:wait`,             // Waiting queue (legacy / compat)
+            `${this.prefix}:meta`,             // Metadata
+            `${this.prefix}:counter`,          // ID counter
+            `${this.prefix}:events`,           // Events stream
+            `${this.prefix}:groups:${group}`,  // Group specific queue
+            `${this.prefix}:groups:set`,       // Groups set
         ];
 
         // Arguments for the script
         const args = [
-            jobName,                    // Job Name
-            JSON.stringify(data),       // Job Data
-            JSON.stringify({}),         // Options (placeholder)
+            jobName,                    // Job name
+            JSON.stringify(data),       // Job data
+            JSON.stringify({}),         // Job options (placeholder)
             timestamp.toString(),       // Timestamp
             this.prefix,                // Prefix for other keys
+            group                       // Group name
         ];
 
         try {
