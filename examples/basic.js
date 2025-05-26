@@ -1,8 +1,8 @@
 import IORedis from 'ioredis';
 
-import Queue from './src/Queue.js';
-import Worker from './src/Worker.js';
-import Metrics from './src/Metrics.js';
+import Queue from '../src/Queue.js';
+import Worker from '../src/Worker.js';
+import Metrics from '../src/Metrics.js';
 
 const main = async () => {
 
@@ -33,7 +33,7 @@ const main = async () => {
     const jobIdp = await queue.add('SEND_EMAIL', {
         email: 'test@test.com',
         subject: 'Test',
-        body: 'Test',
+        body: 'BODY PRE',
         group: { id: 'example2@gmail.com' }
     });
 
@@ -44,7 +44,7 @@ const main = async () => {
         const jobId = await queue.add('SEND_EMAIL', {
             email: 'test@test.com',
             subject: 'Test',
-            body: 'Test',
+            body: `BODY ${i}`,
             group: { id: 'example@gmail.com' }
         });
 
@@ -54,7 +54,7 @@ const main = async () => {
     const jobIdp2 = await queue.add('SEND_EMAIL', {
         email: 'test@test.com',
         subject: 'Test',
-        body: 'Test',
+        body: `BODY POST`,
         group: { id: 'example2@gmail.com' }
     });
 
@@ -68,7 +68,7 @@ const main = async () => {
 
     }, {
         connection,
-        concurrency: 1,
+        concurrency: 2,
         batchSize: 1,
         pollInterval: 1000
     });
