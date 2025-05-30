@@ -67,7 +67,10 @@ class Worker extends EventEmitter {
         this.backoff = {
             type: params.backoff?.type || 'exponential',
             delay: params.backoff?.delay || 1000,
-            maxDelay: params.backoff?.maxDelay || 1000 * 60 * 5 // 5 min
+            maxDelay: params.backoff?.maxDelay || 1000 * 60 * 5, // 5 min
+            strategy: params.backoff?.strategy, // función personalizada de backoff
+            // Porcentaje de jitter (0-1). true == 0.25. 0 o undefined = sin jitter
+            jitter: params.backoff?.jitter
         };
 
         // Worker health monitoring
@@ -85,6 +88,32 @@ class Worker extends EventEmitter {
 
         // util sleep
         this._sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+        /**
+         * Elimina o expira un job según configuración.
+         * @param {string} jobKey clave completa del job
+         * @param {'completed'|'failed'} status
+         * @private
+         */
+        this._handleJobRemoval = async (jobKey, status) => {
+            try {
+                let cfg;
+                if (status === 'completed') cfg = this.removeOnComplete;
+                else if (status === 'failed') cfg = this.removeOnFail;
+
+                if (!cfg) return; // falsy ⇒ no eliminar
+
+                if (cfg === true || cfg === 0) {
+                    // eliminación inmediata
+                    await this.connection.del(jobKey);
+                } else if (typeof cfg === 'number' && cfg > 0) {
+                    // expiración en TTL ms
+                    await this.connection.pexpire(jobKey, cfg);
+                }
+            } catch (err) {
+                console.error('Error scheduling job removal:', err);
+            }
+        };
     }
 
     /**
@@ -264,15 +293,51 @@ class Worker extends EventEmitter {
     /**
      * Calcula el tiempo de espera para reintentos usando backoff
      * @private
+     * @param {number} attempt - Número de intento actual
+     * @param {Object} jobData - Datos del trabajo (opcional)
+     * @param {Error} error - Error que causó el fallo (opcional)
+     * @returns {number} Tiempo de espera en milisegundos
      */
-    calculateBackoff(attempt) {
+    calculateBackoff(attempt, jobData = null, error = null) {
+        const applyJitter = (baseDelay) => {
+            const j = this.backoff.jitter;
+            if (!j) return baseDelay; // sin jitter
+
+            const fraction = typeof j === 'number'
+                ? Math.min(Math.max(j, 0), 1) // clamp 0-1
+                : 0.25; // si es booleano true => 25 %
+
+            const factor = (1 - fraction) + Math.random() * fraction; // rango [1-f, 1]
+            return baseDelay * factor;
+        };
+        // Si hay una estrategia personalizada, usarla
+        if (typeof this.backoff.strategy === 'function') {
+            const delay = this.backoff.strategy({
+                attempt,
+                jobData,
+                error,
+                maxDelay: this.backoff.maxDelay
+            });
+            
+            // Asegurar que el delay esté dentro de los límites
+            const sanitized = Math.min(
+                Math.max(0, delay), // no permitir delays negativos
+                this.backoff.maxDelay
+            );
+            return Math.round(applyJitter(sanitized));
+        }
+
+        // Estrategias predefinidas
         if (this.backoff.type === 'exponential') {
-            return Math.min(
+            const base = Math.min(
                 this.backoff.delay * Math.pow(2, attempt - 1),
                 this.backoff.maxDelay
             );
+            return Math.round(applyJitter(base));
         }
-        return this.backoff.delay;
+
+        // constante
+        return Math.round(applyJitter(Math.min(this.backoff.delay, this.backoff.maxDelay)));
     }
 
     /**
@@ -443,6 +508,9 @@ class Worker extends EventEmitter {
                     .hdel(jobKey, 'token')
                     .exec();
 
+                // Programar eliminación si procede
+                await this._handleJobRemoval(jobKey, 'completed');
+
                 this.emit('completed', { jobId });
 
             } catch (error) {
@@ -453,8 +521,8 @@ class Worker extends EventEmitter {
                     const maxAttempts = parseInt(jobData.maxAttempts || '3');
 
                     if (attempts < maxAttempts) {
-                        // Calcular delay para reintento
-                        const delay = this.calculateBackoff(attempts);
+                        // Calcular delay para reintento usando la estrategia de backoff
+                        const delay = this.calculateBackoff(attempts, jobData, error);
                         const retryAt = Date.now() + delay;
 
                         await this.connection.pipeline()
@@ -479,6 +547,9 @@ class Worker extends EventEmitter {
                             .exec();
                     }
                 }
+
+                // Programar eliminación si procede
+                await this._handleJobRemoval(jobKey, 'failed');
 
                 this.emit('failed', { jobId, error });
             }
