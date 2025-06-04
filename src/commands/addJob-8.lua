@@ -8,6 +8,7 @@
   KEYS[5] - Group specific queue (groups:{group})
   KEYS[6] - Groups set (groups:set)
   KEYS[7] - Delayed jobs sorted set (delayed)
+  KEYS[8] - Priority queue (priority)
   
   ARGV[1] - Job name
   ARGV[2] - Job data (JSON)
@@ -15,6 +16,7 @@
   ARGV[4] - Timestamp
   ARGV[5] - Queue prefix (e.g. "FAZPIAI:EMAILS")
   ARGV[6] - Group name
+  ARGV[7] - Priority
 ]]
 
 local waitKey = KEYS[1]
@@ -24,6 +26,7 @@ local eventsKey = KEYS[4]
 local groupKey = KEYS[5]
 local groupsSet = KEYS[6]
 local delayedKey = KEYS[7]
+local priorityKey = KEYS[8]
 
 -- Generate a unique ID for the job
 local jobId = redis.call("INCR", counterKey)
@@ -35,6 +38,7 @@ local jobKey = prefix .. ":job:" .. jobId
 local opts = cjson.decode(ARGV[3])
 local delay = tonumber(opts["delay"] or "0")
 local timestamp = tonumber(ARGV[4])
+local priority = tonumber(ARGV[7] or "0")
 
 -- Save the job
 local jobData = {
@@ -68,25 +72,40 @@ redis.call("SADD", groupsSet, group)
 -- Add to appropriate queue
 if delay > 0 then
     -- Add to delayed queue with timestamp + delay
-    redis.call("ZADD", delayedKey, timestamp + delay, jobId)
+    local processAt = timestamp + delay
+    redis.call("ZADD", delayedKey, processAt, jobId)
+    redis.call("HSET", jobKey, "status", "delayed", "processAt", processAt)
     
     -- Emit delayed event
     redis.call("XADD", eventsKey, "*", 
         "event", "delayed",
         "jobId", jobId,
         "group", group,
-        "delay", delay
+        "delay", delay,
+        "priority", priority
     )
 else
-    -- Add to group queue
-    redis.call("LPUSH", groupKey, jobId)
+    if priority > 0 then
+        -- Add to priority queue
+        redis.call("LPUSH", priorityKey, jobId)
+    else
+        -- Add to group queue
+        redis.call("LPUSH", groupKey, jobId)
+    end
     
     -- Emit waiting event
     redis.call("XADD", eventsKey, "*", 
         "event", "waiting",
         "jobId", jobId,
-        "group", group
+        "group", group,
+        "priority", priority
     )
+end
+
+-- Update metadata
+redis.call("HINCRBY", metaKey, "total", 1)
+if priority > 0 then
+    redis.call("HINCRBY", metaKey, "priority", 1)
 end
 
 return jobId

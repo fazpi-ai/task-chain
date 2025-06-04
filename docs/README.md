@@ -1,12 +1,32 @@
-# @fazpi-ai/task-chain
- Powerful distributed processing library based on Redis Streams, designed to build parallel, ordered, and reliable workflows.
+### 1. Manejo Mejorado de Trabajos Estancados:
+```
+const worker = new Worker('myApp', 'myQueue', processor, {
+    stalledCheckInterval: 30000,    // Revisar cada 30 segundos
+    maxStalledCount: 3,             // Máximo 3 intentos antes de fallar
+    stalledTimeout: 60000           // Considerar estancado después de 1 minuto
+});
+```
 
+### 2. Sistema de Prioridades:
+```
+// Añadir trabajo con alta prioridad
+await queue.add('email', data, {
+    priority: 10  // Mayor número = mayor prioridad
+});
+
+// Añadir trabajo normal
+await queue.add('email', data, {
+    priority: 0   // Prioridad normal
+});
+```
+
+### 3. Rate Limiting Avanzado:
+```
 // Configuración global
 const queue = new Queue('myApp', 'myQueue', {
-    connection,
     rateLimit: {
-        max: 1000,
-        duration: 60000
+        max: 100,        // Máximo 100 trabajos
+        duration: 60000  // Por minuto
     }
 });
 
@@ -21,6 +41,30 @@ await queue.add('api-call', data, {
 // Rate limit manual
 await queue.rateLimit(5000);              // Global
 await queue.rateLimit(5000, 'api-group'); // Por grupo
+```
+
+### 4. Eventos Mejorados:
+```
+worker.on('stalled', ({ jobId, stalledCount, nextProcessAt }) => {
+    console.log(`Job ${jobId} stalled ${stalledCount} times, next attempt at ${new Date(nextProcessAt)}`);
+});
+
+worker.on('failed', ({ jobId, error, stalled }) => {
+    if (stalled) {
+        console.log(`Job ${jobId} failed due to stalling too many times`);
+    }
+});
+```
+
+### 5. Uso Completo:
+```
+const queue = new Queue('myApp', 'myQueue', {
+    connection,
+    rateLimit: {
+        max: 1000,
+        duration: 60000
+    }
+});
 
 const worker = new Worker('myApp', 'myQueue', async (job) => {
     try {
@@ -71,3 +115,4 @@ setInterval(async () => {
     await queue.clean(24 * 60 * 60 * 1000, 'completed');
     await queue.clean(7 * 24 * 60 * 60 * 1000, 'failed');
 }, 60 * 60 * 1000);
+```

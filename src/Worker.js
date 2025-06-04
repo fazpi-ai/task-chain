@@ -2,6 +2,21 @@ import { EventEmitter } from 'events';
 import { v4 } from 'uuid';
 import os from 'os';
 
+// Errores personalizados
+export class UnrecoverableError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'UnrecoverableError';
+    }
+}
+
+export class RateLimitError extends Error {
+    constructor(message = 'Rate limit reached') {
+        super(message);
+        this.name = 'RateLimitError';
+    }
+}
+
 class Worker extends EventEmitter {
     constructor(appName, queueName, callback, params) {
         super();
@@ -114,6 +129,10 @@ class Worker extends EventEmitter {
                 console.error('Error scheduling job removal:', err);
             }
         };
+
+        // Configuración de trabajos estancados
+        this.stalledCheckInterval = params.stalledCheckInterval || 30000;
+        this.stalledTimeout = params.stalledTimeout || this.lockDuration * 2;
     }
 
     /**
@@ -291,128 +310,113 @@ class Worker extends EventEmitter {
     }
 
     /**
-     * Calcula el tiempo de espera para reintentos usando backoff
+     * Calcula el tiempo de espera para el próximo reintento
      * @private
-     * @param {number} attempt - Número de intento actual
-     * @param {Object} jobData - Datos del trabajo (opcional)
-     * @param {Error} error - Error que causó el fallo (opcional)
-     * @returns {number} Tiempo de espera en milisegundos
      */
     calculateBackoff(attempt, jobData = null, error = null) {
-        const applyJitter = (baseDelay) => {
-            const j = this.backoff.jitter;
-            if (!j) return baseDelay; // sin jitter
-
-            const fraction = typeof j === 'number'
-                ? Math.min(Math.max(j, 0), 1) // clamp 0-1
-                : 0.25; // si es booleano true => 25 %
-
-            const factor = (1 - fraction) + Math.random() * fraction; // rango [1-f, 1]
-            return baseDelay * factor;
-        };
+        const { type, delay, maxDelay, strategy, jitter } = this.backoff;
+        
         // Si hay una estrategia personalizada, usarla
-        if (typeof this.backoff.strategy === 'function') {
-            const delay = this.backoff.strategy({
-                attempt,
-                jobData,
-                error,
-                maxDelay: this.backoff.maxDelay
-            });
-            
-            // Asegurar que el delay esté dentro de los límites
-            const sanitized = Math.min(
-                Math.max(0, delay), // no permitir delays negativos
-                this.backoff.maxDelay
-            );
-            return Math.round(applyJitter(sanitized));
+        if (typeof strategy === 'function') {
+            return strategy(attempt, jobData, error);
         }
 
-        // Estrategias predefinidas
-        if (this.backoff.type === 'exponential') {
-            const base = Math.min(
-                this.backoff.delay * Math.pow(2, attempt - 1),
-                this.backoff.maxDelay
-            );
-            return Math.round(applyJitter(base));
+        let nextDelay;
+        
+        switch (type) {
+            case 'exponential':
+                nextDelay = Math.min(delay * Math.pow(2, attempt - 1), maxDelay);
+                break;
+            case 'linear':
+                nextDelay = Math.min(delay * attempt, maxDelay);
+                break;
+            default: // fixed
+                nextDelay = delay;
         }
 
-        // constante
-        return Math.round(applyJitter(Math.min(this.backoff.delay, this.backoff.maxDelay)));
+        // Aplicar jitter si está configurado
+        if (jitter) {
+            const jitterAmount = typeof jitter === 'number' ? jitter : 0.25;
+            const randomFactor = 1 - jitterAmount + (Math.random() * jitterAmount * 2);
+            nextDelay = Math.floor(nextDelay * randomFactor);
+        }
+
+        return nextDelay;
     }
 
     /**
-     * Recorre los trabajos en estado "processing" sin lock y los reencola.
+     * Mejora del manejo de trabajos estancados
      */
     async recoverStalledJobs() {
-        // Primero marcar todos los trabajos activos como potencialmente estancados
-        const activeJobs = await this.connection.lrange(`${this.prefix}:active`, 0, -1);
-        if (activeJobs.length) {
-            await this.connection.sadd(`${this.prefix}:stalled`, ...activeJobs);
-        }
+        const now = Date.now();
+        const stalledSet = `${this.prefix}:stalled`;
+        const activeSet = `${this.prefix}:active`;
 
-        let cursor = '0';
-        let recovered = 0;
-        do {
-            const [nextCursor, keys] = await this.connection.scan(cursor, 'MATCH', `${this.prefix}:job:*`, 'COUNT', 1000);
-            if (keys.length) {
-                const pipeline = this.connection.pipeline();
-                keys.forEach((k) => {
-                    pipeline.hget(k, 'status');
-                    pipeline.hget(k, 'group');
-                    pipeline.hget(k, 'attempts');
-                });
-                const results = await pipeline.exec();
+        try {
+            // 1. Obtener trabajos activos
+            const activeJobs = await this.connection.zrangebyscore(
+                activeSet,
+                0,
+                now - this.stalledTimeout
+            );
 
-                for (let idx = 0; idx < keys.length; idx++) {
-                    const status = results[idx * 3][1];
-                    const group = results[idx * 3 + 1][1] || 'default';
-                    const attempts = parseInt(results[idx * 3 + 2][1] || '0');
+            if (!activeJobs.length) return;
 
-                    if (status === 'processing') {
-                        const jobId = keys[idx].split(':').pop();
-                        const lockKey = `${this.prefix}:lock:${jobId}`;
-                        const lockExists = await this.connection.exists(lockKey);
-                        
-                        if (!lockExists) {
-                            const stalledCount = await this.connection.hincrby(keys[idx], 'stc', 1);
-                            
-                            if (stalledCount > this.maxStalledCount) {
-                                // Move to failed
-                                await this.connection.pipeline()
-                                    .hset(keys[idx], 'status', 'failed', 'error', 'Job stalled too many times')
-                                    .xadd(`${this.prefix}:events`, '*', 'event', 'failed', 'jobId', jobId, 'error', 'Job stalled too many times')
-                                    .exec();
-                            } else {
-                                // Calculate retry delay
-                                const delay = this.calculateBackoff(attempts + 1);
-                                const retryAt = Date.now() + delay;
+            // 2. Verificar cada trabajo
+            for (const jobId of activeJobs) {
+                const jobKey = `${this.prefix}:job:${jobId}`;
+                const lockKey = `${this.prefix}:lock:${jobId}`;
 
-                                // requeue with delay
-                                await this.connection.pipeline()
-                                    .hset(keys[idx], 
-                                        'status', 'delayed',
-                                        'nextRetryAt', retryAt,
-                                        'attempts', attempts + 1
-                                    )
-                                    .zadd(`${this.prefix}:delayed`, retryAt, jobId)
-                                    .xadd(`${this.prefix}:events`, '*', 'event', 'delayed', 'jobId', jobId)
-                                    .exec();
-                            }
+                const [job, hasLock] = await this.connection.pipeline()
+                    .hgetall(jobKey)
+                    .exists(lockKey)
+                    .exec();
 
-                            console.warn(`[Worker] Job ${jobId} recovered from stalled state (group: ${group})`);
-                            recovered += 1;
-                        }
-                    }
+                if (!job[1] || !job[1].status) continue;
+                if (hasLock[1]) continue; // El trabajo aún tiene un lock válido
+
+                const stalledCount = parseInt(job[1].stalledCount || '0') + 1;
+                const opts = JSON.parse(job[1].opts || '{}');
+                const maxStalls = opts.maxStalledCount || this.maxStalledCount;
+
+                if (stalledCount >= maxStalls) {
+                    // El trabajo ha excedido el número máximo de stalls
+                    await this.connection.pipeline()
+                        .hset(jobKey,
+                            'status', 'failed',
+                            'failedReason', `Stalled ${stalledCount} times`,
+                            'finishedOn', now
+                        )
+                        .zadd(`${this.prefix}:failed`, now, jobId)
+                        .zrem(activeSet, jobId)
+                        .exec();
+
+                    this.emit('failed', {
+                        jobId,
+                        error: new Error(`Job stalled ${stalledCount} times`),
+                        stalled: true
+                    });
+                } else {
+                    // Reintentar el trabajo
+                    const group = job[1].group || 'default';
+                    const delay = this.calculateBackoff(stalledCount, job[1]);
+                    const nextProcessAt = now + delay;
+
+                    await this.connection.pipeline()
+                        .hset(jobKey,
+                            'status', 'delayed',
+                            'stalledCount', stalledCount,
+                            'nextProcessAt', nextProcessAt
+                        )
+                        .zadd(`${this.prefix}:delayed`, nextProcessAt, jobId)
+                        .zrem(activeSet, jobId)
+                        .exec();
+
+                    this.emit('stalled', { jobId, stalledCount, nextProcessAt });
                 }
             }
-            cursor = nextCursor;
-        } while (cursor !== '0');
-
-        // Limpiar set de trabajos estancados
-        await this.connection.del(`${this.prefix}:stalled`);
-
-        if (recovered > 0) {
-            console.log(`[Worker] Stall recovery cycle completed. Recovered: ${recovered}`);
+        } catch (error) {
+            console.error('Error recovering stalled jobs:', error);
         }
     }
 
@@ -429,138 +433,124 @@ class Worker extends EventEmitter {
     }
 
     /**
-     * Procesa un job individual manteniendo los mapas de seguimiento
+     * Maneja el procesamiento de un trabajo
      * @private
      */
     async _handleJob(jobId, group) {
-        const groupProcessingMap = this.processingByGroup.get(group);
         const jobKey = `${this.prefix}:job:${jobId}`;
+        const groupProcessingMap = this.processingByGroup.get(group);
 
-        // Try to get the lock
+        // Obtener lock
         const token = await this.acquireLock(jobId);
-        if (!token) {
-            console.warn(`Could not get lock for job ${jobId}`);
-            return;
-        }
-
-        // Register the job as being processed (global and by group)
-        this.processingJobs.set(jobId, token);
-        groupProcessingMap.set(jobId, Date.now());
+        if (!token) return;
 
         try {
-            // Marcar como en proceso con token atomicamente
-            const multi = this.connection.multi();
-            multi.watch(jobKey);
-
+            // Obtener datos del trabajo
             const jobData = await this.connection.hgetall(jobKey);
             if (!jobData) {
                 await this.releaseLock(jobId, token);
-                this.processingJobs.delete(jobId);
-                groupProcessingMap.delete(jobId);
                 return;
             }
 
-            if (!jobData.data) jobData.data = '{}';
-
-            let parsedData;
+            // Parsear datos
             try {
-                parsedData = JSON.parse(jobData.data);
-            } catch (parseError) {
-                console.error(`Error parsing job data for ${jobId}:`, parseError);
-                parsedData = {};
+                jobData.data = JSON.parse(jobData.data);
+                jobData.opts = JSON.parse(jobData.opts);
+            } catch (e) {
+                console.error(`Error parsing job data for ${jobId}:`, e);
+                throw new UnrecoverableError('Invalid job data format');
             }
 
-            // Verificar y actualizar estado atomicamente
-            multi
+            // Registrar el trabajo en proceso
+            this.processingJobs.set(jobId, token);
+            groupProcessingMap.set(jobId, token);
+
+            // Actualizar metadatos del trabajo
+            await this.connection.pipeline()
                 .hset(jobKey,
-                    'status', 'processing',
-                    'token', token,
+                    'status', 'active',
                     'processedOn', Date.now(),
-                    'processedBy', this.workerId
-                );
-
-            const results = await multi.exec();
-            if (!results) {
-                console.warn(`Job ${jobId} was taken by another worker`);
-                return;
-            }
-
-            this.emit('processing', { jobId, data: jobData });
+                    'workerId', this.workerId
+                )
+                .hincrby(jobKey, 'attemptsStarted', 1)
+                .exec();
 
             try {
-                const result = await this.callback({ id: jobId, name: jobData.name || 'unknown', data: parsedData });
+                // Procesar el trabajo
+                const result = await this.callback(jobData, token);
 
-                // Confirmar completado solo si aún tenemos el token
-                const completePipeline = this.connection.multi();
-                completePipeline.watch(jobKey);
-
-                const currentToken = await this.connection.hget(jobKey, 'token');
-                if (currentToken !== token) {
-                    throw new Error('Job token mismatch');
-                }
-
-                completePipeline
+                // Marcar como completado
+                await this.connection.pipeline()
                     .hset(jobKey,
                         'status', 'completed',
                         'finishedOn', Date.now(),
-                        'result', JSON.stringify(result)
+                        'returnvalue', JSON.stringify(result)
                     )
+                    .zadd(`${this.prefix}:completed`, Date.now(), jobId)
                     .hdel(jobKey, 'token')
                     .exec();
 
-                // Programar eliminación si procede
+                this.emit('completed', { jobId, result });
+
+                // Manejar eliminación si está configurado
                 await this._handleJobRemoval(jobKey, 'completed');
 
-                this.emit('completed', { jobId });
-
             } catch (error) {
-                // Solo marcar como fallido si aún tenemos el token
-                const currentToken = await this.connection.hget(jobKey, 'token');
-                if (currentToken === token) {
-                    const attempts = await this.connection.hincrby(jobKey, 'attempts', 1);
-                    const maxAttempts = parseInt(jobData.maxAttempts || '3');
-
-                    if (attempts < maxAttempts) {
-                        // Calcular delay para reintento usando la estrategia de backoff
-                        const delay = this.calculateBackoff(attempts, jobData, error);
-                        const retryAt = Date.now() + delay;
-
-                        await this.connection.pipeline()
-                            .hset(jobKey,
-                                'status', 'delayed',
-                                'nextRetryAt', retryAt,
-                                'error', error.message
-                            )
-                            .zadd(`${this.prefix}:delayed`, retryAt, jobId)
-                            .hdel(jobKey, 'token')
-                            .xadd(`${this.prefix}:events`, '*', 'event', 'delayed', 'jobId', jobId)
-                            .exec();
-                    } else {
-                        await this.connection.pipeline()
-                            .hset(jobKey,
-                                'status', 'failed',
-                                'error', error.message,
-                                'finishedOn', Date.now()
-                            )
-                            .hdel(jobKey, 'token')
-                            .xadd(`${this.prefix}:events`, '*', 'event', 'failed', 'jobId', jobId, 'error', error.message)
-                            .exec();
-                    }
+                // Determinar si el error es recuperable
+                const isUnrecoverable = error instanceof UnrecoverableError;
+                const isRateLimit = error instanceof RateLimitError;
+                
+                if (!isRateLimit) {
+                    await this.connection.hincrby(jobKey, 'attemptsMade', 1);
                 }
 
-                // Programar eliminación si procede
-                await this._handleJobRemoval(jobKey, 'failed');
+                const attempts = parseInt(await this.connection.hget(jobKey, 'attemptsMade')) || 0;
+                const maxAttempts = jobData.opts.attempts || 1;
 
-                this.emit('failed', { jobId, error });
+                if (isUnrecoverable || attempts >= maxAttempts) {
+                    // Marcar como fallido permanentemente
+                    await this.connection.pipeline()
+                        .hset(jobKey,
+                            'status', 'failed',
+                            'failedReason', error.message,
+                            'finishedOn', Date.now()
+                        )
+                        .zadd(`${this.prefix}:failed`, Date.now(), jobId)
+                        .hdel(jobKey, 'token')
+                        .exec();
+
+                    this.emit('failed', { jobId, error });
+                    
+                    if (attempts >= maxAttempts) {
+                        this.emit('retries-exhausted', { jobId, attemptsMade: attempts });
+                    }
+
+                    // Manejar eliminación si está configurado
+                    await this._handleJobRemoval(jobKey, 'failed');
+                } else {
+                    // Calcular delay para reintento
+                    const delay = this.calculateBackoff(attempts + 1, jobData, error);
+                    const nextProcessAt = Date.now() + delay;
+
+                    // Mover a delayed para reintento
+                    await this.connection.pipeline()
+                        .hset(jobKey,
+                            'status', 'delayed',
+                            'failedReason', error.message,
+                            'nextProcessAt', nextProcessAt
+                        )
+                        .zadd(`${this.prefix}:delayed`, nextProcessAt, jobId)
+                        .hdel(jobKey, 'token')
+                        .exec();
+
+                    this.emit('failed', { jobId, error, willRetry: true });
+                }
             }
-
-        } catch (error) {
-            console.error(`Error processing job ${jobId}:`, error);
-            this.emit('error', { jobId, error });
         } finally {
-            await this.releaseLock(jobId, token);
+            // Limpieza
             this.processingJobs.delete(jobId);
             groupProcessingMap.delete(jobId);
+            await this.releaseLock(jobId, token);
         }
     }
 }
